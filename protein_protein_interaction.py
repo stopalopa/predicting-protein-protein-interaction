@@ -28,6 +28,7 @@ import random
 from torch.utils.data import DataLoader,Dataset
 import torchvision.transforms as transforms
 import numpy as np
+import matplotlib.pyplot as plt
 
 class Config():
   train_batch_size = 32
@@ -39,6 +40,8 @@ index_to_char = {0: 'M', 1: 'S', 2: 'V', 3: 'E', 4: 'D', 5: 'F', 6: 'I', 7: 'Q',
 n_letters = len(char_to_index)
 
 #https://colab.research.google.com/notebook#fileId=/v2/external/notebooks/io.ipynb&scrollTo=p2E4EKhCWEC5
+#https://github.com/szagoruyko/pytorchviz/blob/master/examples.ipynb - double backpropogation
+#batching with sequence data
 
 def letterToIndex(letter):
   return char_to_index[letter]
@@ -49,9 +52,9 @@ def letterToTensor(letter):
   return tensor
 
 def aminoAcidstoTensor(aminoAcidSeq):
-  tensor = torch.zeros(len(aminoAcidSeq), 1, n_letters)
+  tensor = torch.zeros(1, n_letters, len(aminoAcidSeq)) #torch.zeros(len(aminoAcidSeq), 1, n_letters)
   for idx, letter in enumerate(aminoAcidSeq):
-    tensor[idx][0][letterToIndex(letter)] = 1
+    tensor[0][letterToIndex(letter)][idx] = 1
   return tensor
 
 categories = [0, 1]
@@ -73,80 +76,45 @@ with open('train_file.txt') as train_data:
     
 train_data.close()
 
-class ProteinDataset(Dataset):
-  def __init__(self, data):
-    self.data = data
-    self.count = 0
-    #self.transform = transform
-  
-  def __getitem__(self, index):
-    sample = self.data[self.count]
-    pair_label = sample.split(' ')
-    protein_pair = pair_label[0].split('-')
-    protein_name_1 = protein_pair[0]
-    protein_name_2 = protein_pair[1]
-    label = pair_label[1]
-    
-    protein_seq_1 = proteins[protein_name_1]
-    protein_seq_2 = proteins[protein_name_2]
-    
-    #Variable(aminoAcidstoTensor(protein_seq_1)).cuda()
-    protein_1_tensor = aminoAcidstoTensor(protein_seq_1)
-    protein_2_tensor = aminoAcidstoTensor(protein_seq_2)
-    
-    #torch.cuda.LongTensor?
-    label_tensor = torch.LongTensor([categories.index(0)])
-    self.count += 1
-    
-    #dimensions returned value: len of amino acid seq x 1 x #amino acids (21)
-    return protein_1_tensor, protein_2_tensor, label_tensor
-  
-  def __len__(self):
-    return len(self.data)
-
-protein_dataset = ProteinDataset(training_data) #transform=transforms.Compose([transforms.ToTensor()]))
-
-#protein_dataset.__getitem__(0)
-#[categories.index(0)]
-
-def new_collate(batch):
-    print("in batch")
-    print(batch)
-    protein_1 = [item[0] for item in batch]
-    protein_2 = [item[1] for item in batch]
-    target = [item[2] for item in batch]
-    return [protein_1, protein_2, target]
-
-train_dataloader = DataLoader(protein_dataset, shuffle=True, collate_fn=new_collate, num_workers=1, batch_size=Config.train_batch_size)
-
 class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
         self.hidden_size = 1
         self.num_layers = 1
-        #could also pass in num_layers, but assume 1 in this case
-        #inchannels=input height, outchannels=number filters, kernel size= filter size
-        #shape of input is batch size x channels x width
-        #danq: Convolution1D(input_dim=4,input_length=1000, nb_filter=320, filter_length=26,
-        self.conv1 = nn.Conv1d(21, 10, 26)
-        self.pool1 = nn.MaxPool1d(13, 13)
+
+        #torch.nn.functional.conv2d(input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1) → Tensor
+        filters = torch.randn(8,4,3,3)
+        inputs = torch.randn(1,4,5,5)
         
-        #self.lstm = nn.LSTM(input_size, hidden_size, bidirectional=True)
-        self.lstm = nn.LSTM(self.hidden_size, self.hidden_size, batch_first=True, bidirectional=True)
-        #self.fc Linear(in_features, out_features (num classes))
+        #Conv2d(in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True)
+        self.conv = nn.Conv2d(1, 12, (21, 1))
+        
+        #LSTM(self.hidden_size, self.hidden_size, batch_first=True, bidirectional=True)
+        self.lstm = nn.LSTM(12, self.hidden_size, bidirectional=True)
+        
+        # Linear(in_features, out_features (num classes))
         self.fc = nn.Linear(self.hidden_size * 2, 2)
 
 
     def forward_once(self, x):
+        #input: batch size x Cin x Height x Width  i.e. [1, 1, 21, 325]
+        
         h0 = Variable(torch.zeros(self.num_layers * 2, self.hidden_size))  # 2 for bidirection
         c0 = Variable(torch.zeros(self.num_layers * 2, self.hidden_size))
-
-        x = F.relu(self.conv1(x))
-        x = self.pool1(x) 
-        out, (h_n, c_n) = self.lstm(x, (h0, c0))
-        out = self.fc(out[:, -1, :])
-
-        return x
+        
+        seq_len = x.size()[3]
+        self.conv.kernel_size = (seq_len, 21)
+        x = self.conv(x)
+        x = F.max_pool2d(F.relu(x), (1, 6))    #output: 1xoutchannelx1xsize_due_to_conv
+        x = torch.squeeze(x, 2)                #output: 1xoutchannelxsize_due_to_convolution
+        x = x.permute(2, 0, 1)                 #output: conv_size x 1 x out_channels
+    
+        #input expected: (seq_len, batch, input_size)  batch first: (batch, seq, feature)
+        out, (h_n, c_n) = self.lstm(x, (h0, c0)) #output (seq_len, batch, hidden_size * num_directions)
+        #output (seq_len (conv_size), batch, hidden_size * num_directions) ie 54, 1, 2
+        out = self.fc(out[-1, :, :])
+       
+        return out
 
 
     def forward(self, x1, x2):
@@ -154,32 +122,25 @@ class Net(nn.Module):
         output2 = self.forward_once(x2)
         return output1, output2
 
-def printnorm(self, input, output):
-    # input is a tuple of packed inputs
-    # output is a Variable. output.data is the Tensor we are interested
-    print('Inside ' + self.__class__.__name__ + ' forward')
-    print('')
-    print('input: ', type(input))
-    print('input[0]: ', type(input[0]))
-    print('output: ', type(output))
-    print('')
-    print('input size:', input[0].size())
-    print('output size:', output.data.size())
-    print('output norm:', output.data.norm())
+def getProteinPair(index):
+  sample = training_data[index]
+  pair_label = sample.split(' ')
+  protein_pair = pair_label[0].split('-')
+  protein_name_1 = protein_pair[0]
+  protein_name_2 = protein_pair[1]
+  label = pair_label[1]
+  
+  protein_seq_1 = proteins[protein_name_1]
+  protein_seq_2 = proteins[protein_name_2]
+    
+  #Variable(aminoAcidstoTensor(protein_seq_1)).cuda()
+  
+  protein_1_tensor = Variable(aminoAcidstoTensor(protein_seq_1))
+  #get seq_length x 1 x  21
+  protein_2_tensor = Variable(aminoAcidstoTensor(protein_seq_2))
 
-
-def printgradnorm(self, grad_input, grad_output):
-    print('Inside ' + self.__class__.__name__ + ' backward')
-    print('Inside class:' + self.__class__.__name__)
-    print('')
-    print('grad_input: ', type(grad_input))
-    print('grad_input[0]: ', type(grad_input[0]))
-    print('grad_output: ', type(grad_output))
-    print('grad_output[0]: ', type(grad_output[0]))
-    print('')
-    print('grad_input size:', grad_input[0].size())
-    print('grad_output size:', grad_output[0].size())
-    print('grad_input norm:', grad_input[0].data.norm())
+  label_tensor = Variable(torch.LongTensor([categories.index(0)]))
+  return protein_1_tensor, protein_2_tensor, label_tensor
 
 class ContrastiveLoss(torch.nn.Module):
     """
@@ -187,45 +148,78 @@ class ContrastiveLoss(torch.nn.Module):
     Based on: http://yann.lecun.com/exdb/publis/pdf/hadsell-chopra-lecun-06.pdf
     """
 
-    def __init__(self, margin=2.0):
+    def __init__(self, margin=.5):
         super(ContrastiveLoss, self).__init__()
         self.margin = margin
 
     def forward(self, output1, output2, label):
         euclidean_distance = F.pairwise_distance(output1, output2)
+        label = label.type(torch.FloatTensor)
         loss_contrastive = torch.mean((1-label) * torch.pow(euclidean_distance, 2) +
                                       (label) * torch.pow(torch.clamp(self.margin - euclidean_distance, min=0.0), 2))
-
-
+       
         return loss_contrastive
-
-dataiter = iter(train_dataloader)
-protein1, protein2, l = next(dataiter)
-
-net = Net()
-output1, output2 = net(Variable(protein1[0]), Variable(protein2[0]))
-print(output1)
-print(output2)
-
-#Net().cuda
-#net = Net()
-#print(net)
-#net.conv1.register_forward_hook(printnorm)
-#net.conv1.register_backward_hook(printgradnorm)
-
-
-
-output1, output2 = net(protein1, protein2)
-
-#criterion = ContrastiveLoss()
-#optimizer = optim.Adam(net.parameters(), Config.learning_rate)
 
 counter = []
 loss_history = []
 iteration_number = 0
 
-for epoch in range(Config.train_number_epochs):
-    for i, data in enumerate(train_dataloader):
+#net.conv1.register_forward_hook(printnorm)
+#net.conv1.register_backward_hook(printgradnorm)
+
+net = Net()
+
+
+#get protein of dimensions: batch x height(21) x seq_length
+for epoch in range(1):
+  for i in range(0, 6):
+    counter.append(i)
+    protein1, protein2, label = getProteinPair(i)
+    protein1 = protein1.unsqueeze(0)  #add a dimension for c_in
+    protein2 = protein2.unsqueeze(0)
+    output1, output2 = net(protein1, protein2)
+    #output: size_conv x 2 
+
+    criterion = ContrastiveLoss()
+    optimizer = optim.Adam(net.parameters(), Config.learning_rate)
+
+    optimizer.zero_grad()
+    contrastive_loss = criterion(output1, output2, label)
+    contrastive_loss.backward()
+    optimizer.step()
+    loss_history.append(contrastive_loss.data[0])
+
+print(loss_history)
+plt.plot(counter,loss_history)
+plt.show()
+
+test = Variable(torch.rand(1, 2))
+print(test)
+print(1 - test)
+
+input_size = 20
+hidden_size = 50
+output_size = 7
+batch_size = 1
+n_layers = 2
+seq_len = 15
+
+inputs = Variable(torch.rand(seq_len, batch_size, input_size, hidden_size))
+print(inputs.size())
+
+x = torch.squeeze(inputs, 1)
+print(x.size())
+x = x.permute(0, 2, 1)
+print(x.size())
+x = x.long()
+print(x.dtype)
+
+counter = []
+loss_history = []
+iteration_number = 0
+
+#for epoch in range(Config.train_number_epochs):
+#    for i, data in enumerate(train_dataloader):
         protein1, protein2, label = data
         output1, output2 = net(protein1, protein2)
         optimizer.zero_grad()
