@@ -38,6 +38,10 @@ class Config():
   checkpoint = "2018"  #datetime.datetime.fromtimestamp(time.time()).strftime('%H:%M:%S')
   print_freq = 500
   checkpoint_dir = datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d')
+  kernel_size = 5  
+  pool_size = 2
+  start_epoch = 0
+  best_acc = 0
 
   
 def letterToIndex(letter):
@@ -83,7 +87,8 @@ def importData():
 
   testing_data.close()
 
-def save_checkpoint(state, is_best, filename="./" + Config.checkpoint_dir + "/" +Config.checkpoint + ".tar"):
+def save_checkpoint(state, is_best):
+  filename="./" + Config.checkpoint_dir + "/" +Config.checkpoint + ".tar"
   if is_best:
       filename ="./" + Config.checkpoint_dir + "/best_" + Config.checkpoint + ".tar"
   torch.save(state, filename)
@@ -96,10 +101,10 @@ class Net(nn.Module):
         self.lstm_num_layers = Config.lstm_num_layers
         
         #Conv2d(in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True)
-        self.conv = nn.Conv2d(1, Config.conv_filter_size, (21, 1))
+        self.conv = nn.Conv2d(1, Config.conv_filter_size, (21, Config.kernel_size))
         
         #LSTM(self.hidden_size, self.hidden_size, batch_first=True, bidirectional=True)
-        self.lstm = nn.LSTM(12, self.hidden_size, self.lstm_num_layers, bidirectional=True)
+        self.lstm = nn.LSTM(Config.conv_filter_size, self.hidden_size, self.lstm_num_layers, bidirectional=True)
         
         # Linear(in_features, out_features (num classes))
         self.fc = nn.Linear(self.hidden_size * 2, Config.fc_num_classes)
@@ -112,9 +117,11 @@ class Net(nn.Module):
         c0 = Variable(torch.zeros(self.lstm_num_layers * 2, 1, self.hidden_size))
         
         seq_len = x.size()[3]
-        self.conv.kernel_size = (seq_len, 21)
+        #self.conv.kernel_size = (seq_len, 21)
+        
         x = self.conv(x)
-        x = F.max_pool2d(F.relu(x), (1, 6))    #output: 1xoutchannelx1xsize_due_to_conv
+        #x = F.max_pool2d(F.relu(x), (1, int(Config.conv_filter_size/2)))    #output: 1xoutchannelx1xsize_due_to_conv
+        x = F.max_pool2d(F.relu(x), (1, Config.pool_size))
         x = torch.squeeze(x, 2)                #output: 1xoutchannelxsize_due_to_convolution
         x = x.permute(2, 0, 1)                 #output: conv_size x 1 x out_channels
     
@@ -142,8 +149,10 @@ def getProteinPair(index, data_set):
   protein_pair = pair_label[0].split('-')
   protein_name_1 = protein_pair[0]
   protein_name_2 = protein_pair[1]
-  label = pair_label[1]
-  
+  if int(pair_label[1]) == 1:
+    label = 0
+  else:
+    label = 1
   protein_seq_1 = proteins[protein_name_1]
   protein_seq_2 = proteins[protein_name_2]
     
@@ -164,19 +173,12 @@ class AverageMeter(object):
     self.avg = 0
     self.tot_sum = 0
     self.count = 0
-
-  def reset(self):
-    self.val = 0
-    self.avg = 0
-    self.tot_sum = 0
-    self.count = 0
     
   def update(self, val):
     self.val = val
     self.tot_sum += val
     self.count += 1
     self.avg = self.tot_sum/self.count
-  
 
 
 class ContrastiveLoss(torch.nn.Module):
@@ -193,12 +195,13 @@ class ContrastiveLoss(torch.nn.Module):
         label = label.type(torch.FloatTensor).cuda()
         loss_contrastive = torch.mean((1-label) * torch.pow(euclidean_distance, 2).cuda() +
                                       (label) * torch.pow(torch.clamp(Config.margin - euclidean_distance, min=0.0), 2)).cuda()
+        #loss_contrastive = label*torch.pow(euclidean_distance, 2).cuda() + torch.mean(1-label)*torch.pow(torch.clamp(Config.margin - euclidean_distance, min=0.0), 2)).cuda()
        
         return loss_contrastive
       
 
 def accuracy(output1, output2, label):
-  if ((F.pairwise_distance(output1.data, output2.data) < Config.margin).cpu().numpy() and label.data.cpu().numpy()==1):
+  if ((F.pairwise_distance(output1.data, output2.data) < Config.margin/2).cpu().numpy() and label.data.cpu().numpy()==0):
     return 1
   else:
     return 0
@@ -206,20 +209,19 @@ def accuracy(output1, output2, label):
 def validate(net, criterion, optimizer):
   net.eval()
   losses = AverageMeter()
-  accuracy_avg = AverageMeter()
-  
+  accuracy_avg = AverageMeter()  
   size_val = len(val_data)
   acc = 0
-  size_val = 3
   for i in range(0, size_val):
     protein1, protein2, label = getProteinPair(i, "val")
     output1, output2 = net(protein1, protein2)
+    #print(label)
+    #print("distance", F.pairwise_distance(output1, output2)) 
     loss = criterion(output1, output2, label)
-    acc += accuracy(output1, output2, label)
-    accuracy_avg.update(acc)
+    accuracy_avg.update(accuracy(output1, output2, label))
     losses.update(loss.data[0])
 
-    if i % Config.print_freq == 0:
+    if i % Config.print_freq/10 == 0:
       print('Loss value', losses.val)
       print('Loss average', losses.avg) 
 
@@ -227,20 +229,21 @@ def validate(net, criterion, optimizer):
 
 
 def train(net, criterion, optimizer):
+  loss_history = []
   losses = AverageMeter()
   acc = 0
  # f = open('{0}_{1}_{2}.csv'.format(Config.train_number_epochs, Config.learning_rate, Config.margin), 'w')
-  best_acc = 0
-  for epoch in range(Config.train_epochs): 
+  Config.best_acc = 0
+  for epoch in range(Config.start_epoch, Config.train_epochs): 
     print("epoch ", epoch)
-    size_train = len(train_data)
-    print("accuracy", acc/size_train)
+    size_train = len(training_data)
+    print("accuracy ", acc/size_train)
     acc = 0
     for i in range(0, size_train):
-      if i % Config.print_freq == 0:
-        print(str(datetime.datetime.now())) #11:45 shows as 3:45
-        print(i)
-      counter.append(i)
+      #if i % Config.print_freq == 0:
+        #print(str(datetime.datetime.now())) #11:45 shows as 3:45
+        #print(i)
+      #counter.append(i)
       protein1, protein2, label = getProteinPair(i, "train")
       output1, output2 = net(protein1, protein2)
       #question: how does this work? _, preds = torch.max(outputs.data, 1)
@@ -251,18 +254,18 @@ def train(net, criterion, optimizer):
       contrastive_loss.backward()
       optimizer.step()
       acc += accuracy(output1, output2, label)
-      if i % Config.print_freq == 0:
-        print(str(datetime.datetime.now()))
-        print("sample", i)
+      #if i % Config.print_freq == 0:
+        #print(str(datetime.datetime.now()))
+        #print("sample", i)
       
     loss_history.append(contrastive_loss.data[0])
     print("loss", loss_history)
-    is_best = acc/size_train > best_acc
-    best_acc = max(acc/size_train, best_acc)
+    is_best = acc/size_train > Config.best_acc
+    Config.best_acc = max(acc/size_train, Config.best_acc)
     save_checkpoint({
       'epoch':epoch+1,
       'state_dict': net.state_dict(),
-      'best_acc': best_acc,
+      'best_acc': Config.best_acc,
       'optimizer': optimizer.state_dict()}, is_best)
                     
  # loss_hist_str = ' '.join(str(loss_history) for l in loss)
@@ -270,9 +273,7 @@ def train(net, criterion, optimizer):
   #plt.plot(counter,loss_history)
   #plt.show()
 
-counter = []
-loss_history = []
-iteration_number = 0
+
 
 def main():
   
@@ -285,9 +286,12 @@ def main():
   parser.add_argument('--hidden_size', default=1)
   parser.add_argument('--lstm_num_layers', default=1)
   parser.add_argument('--fc_num_classes', default=2)
-  parser.add_argument('--print_freq', default=1000)
+  parser.add_argument('--print_freq', default=10000)
   parser.add_argument('--resume', default=0)
-  
+  parser.add_argument('--desc', default="")
+  parser.add_argument('--kernel_size', default = 5)
+  parser.add_argument('--pool_size', default = 2)  
+
   args = parser.parse_args()
   Config.train_epochs = int(args.train_epochs)
   Config.learning_rate = float(args.learning_rate)
@@ -298,20 +302,34 @@ def main():
   Config.lstm_num_layers = int(args.lstm_num_layers)
   Config.fc_num_classes = int(args.fc_num_classes)
   Config.print_freq = int(args.print_freq)
-
+  Config.kernel_size = int(args.kernel_size)
+  Config.pool_size = int(args.pool_size)
+  Config.start_epoch = 0
+ 
+  print("train epochs ", Config.train_epochs)
+  print("learning rate ", Config.learning_rate)
+  print("margin ", Config.margin)
+  print("batch size ", Config.batch_size)
+  print("filter size ", Config.conv_filter_size)
+  print("hidden_size ", Config.hidden_size)
+  print("lstm num layers ", Config.lstm_num_layers)
+  print("fc num classes ", Config.fc_num_classes)
+  print("print freq", Config.print_freq)
+  print("kernel size ", Config.kernel_size)
+  print("pool size ", Config.pool_size)
 
   ts = datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d_%H:%M:%S')
 
   
-  Config.checkpoint = '{}_{}_{}_{}_{}_{}_{}_{}_{}'.format(ts, args.train_epochs, str(args.learning_rate)[2:], str(args.margin).replace('.', ''), args.batch_size, args.conv_filter_size, args.hidden_size, args.lstm_num_layers, args.fc_num_classes)
+  Config.checkpoint = '{}_{}_{}_{}_{}_{}_{}_{}_{}_{}'.format(ts, args.train_epochs, str(args.learning_rate)[2:], str(args.margin).replace('.', ''), args.batch_size, args.kernel_size, args.conv_filter_size, args.hidden_size, args.lstm_num_layers, args.fc_num_classes)
   print(Config.checkpoint)
 
   ts = datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d')
 
-  if not os.path.isdir(ts):
-    os.makedirs(ts)
+  if not os.path.isdir(ts + "_" + args.desc):
+    os.makedirs(ts + "_" + args.desc)
 
-  Config.checkpoint_dir = ts
+  Config.checkpoint_dir = ts + "_" + args.desc
   torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
   importData() 
@@ -325,8 +343,8 @@ def main():
     if os.path.isfile(args.resume):
       print("=> loading checkpoint '{}'".format(args.resume))
       checkpoint = torch.load(args.resume)
-      args.start_epoch = checkpoint['epoch']
-      best_acc = checkpoint['best_acc']
+      Config.start_epoch = checkpoint['epoch']
+      Config.best_acc = checkpoint['best_acc']
       net.load_state_dict(checkpoint['state_dict'])
       optimizer.load_state_dict(checkpoint['optimizer'])
       print("=> loaded checkpoint '{}' (epoch {})".format(args.resume, checkpoint['epoch']))
