@@ -55,12 +55,12 @@ def letterToIndex(letter):
   return char_to_index[letter]
 
 def letterToTensor(letter):
-  tensor = torch.zeros(1, n_letters).cuda()
+  tensor = torch.zeros(1, n_letters)
   tensor[0][letterToIndex(letter)] = 1
   return tensor
 
 def aminoAcidstoTensor(aminoAcidSeq):
-  tensor = torch.zeros(1, n_letters, len(aminoAcidSeq)).cuda()  #torch.zeros(len(aminoAcidSeq), 1, n_letters)
+  tensor = torch.zeros(1, n_letters, len(aminoAcidSeq))  #torch.zeros(len(aminoAcidSeq), 1, n_letters)
   for idx, letter in enumerate(aminoAcidSeq):
     tensor[0][letterToIndex(letter)][idx] = 1
   return tensor
@@ -121,7 +121,7 @@ def getProteinPair(index, data_set):
   protein_1_tensor = protein_1_tensor.unsqueeze(0)  # add a dimension for c_in
   protein_2_tensor = protein_2_tensor.unsqueeze(0)
 
-  label_tensor = Variable(torch.LongTensor([categories.index(int(label))]).cuda())
+  label_tensor = Variable(torch.LongTensor([categories.index(int(label))]))
   return protein_1_tensor, protein_2_tensor, label_tensor
 
 
@@ -136,9 +136,9 @@ class ContrastiveLoss(torch.nn.Module):
 
     def forward(self, output1, output2, label):
         euclidean_distance = F.pairwise_distance(output1, output2)
-        label = label.type(torch.FloatTensor).cuda()
-        loss_contrastive = torch.mean((1-label) * torch.pow(euclidean_distance, 2).cuda() +
-                                      (label) * torch.pow(torch.clamp(Config.margin - euclidean_distance, min=0.0), 2)).cuda()
+        label = label.type(torch.FloatTensor)
+        loss_contrastive = torch.mean((1-label) * torch.pow(euclidean_distance, 2) +
+                                      (label) * torch.pow(torch.clamp(Config.margin - euclidean_distance, min=0.0), 2))
 
         return loss_contrastive
 
@@ -171,7 +171,7 @@ def categoryFromOutput(output):
     
 
 class MetricMeter(object):
-  def __init__(self):
+  def __init__(self, threshold):
     self.count = 0
     self.tp = 0
     self.fp = 0
@@ -180,6 +180,7 @@ class MetricMeter(object):
     self.y_true = []
     self.y_pred = []
     self.count = 0
+    self.threshold = threshold
 
   def update(self, guess, label):
     self.count += 1
@@ -265,9 +266,6 @@ def findMetrics(outputs_1, outputs_2, labels, threshold):
       
 def eval(net, criterion, optimizer, split):
   print("Evaluating split: ", split)
-  outputs1 = []
-  outputs2 = []
-  labels = []
   data_set = training_data
   if split == 'val':
     data_set = val_data
@@ -279,43 +277,48 @@ def eval(net, criterion, optimizer, split):
   net.eval()
   losses = AverageMeter()
 
+  metrics = []
+  for i in range(1, 13, 2):
+    metrics.append(MetricMeter(i/10))
+
   for i in range(0, size_split):
     protein1, protein2, label = getProteinPair(i, split)
     output1, output2 = net(protein1, protein2)
-    outputs1.append(output1)
-    outputs2.append(output2)
-    labels.append(label)
-    loss = criterion(output1, output2, label)  
+    loss = criterion(output1, output2, label)
     losses.update(loss.data[0])
+    for metric in metrics:
+      metric.update(getPred(output1, output2, metric.threshold), label)
 
-  return losses, outputs1, outputs2, labels
+  return losses
 
 
-def print_eval(metrics, split, epoch_num, threshold):
-  print("true positives", metrics.tp, "false positives", metrics.fp, "true negatives", metrics.tn, "false negatives", metrics.fn)
+def print_eval(metrics, split, epoch_num):
+  for metric in metrics:
+    print(metrics.threshold)
+    print("true positives", metrics.tp, "false positives", metrics.fp, "true negatives", metrics.tn, "false negatives", metrics.fn)
 
-  if metrics.tp + metrics.fn != 0:
-    print(split,"sensitivity", (metrics.tp)/(metrics.tp + metrics.fn))
-  else:
-    print(split, "sensitivity 0")
+    if metrics.tp + metrics.fn != 0:
+      print(split,"sensitivity", (metrics.tp)/(metrics.tp + metrics.fn))
+    else:
+      print(split, "sensitivity 0")
   
-  if metrics.tn + metrics.fp != 0:
-    print(split, "specificity", (metrics.tn)/(metrics.tn + metrics.fp))
-  else:
-    print(split, "specificity 0")
+    if metrics.tn + metrics.fp != 0:
+      print(split, "specificity", (metrics.tn)/(metrics.tn + metrics.fp))
+    else:
+      print(split, "specificity 0")
   
-  if metrics.tp + metrics.fp + metrics.fn + metrics.tn != 0:
-    print(split, "accuracy", (metrics.tp + metrics.tn)/(metrics.tp + metrics.fp + metrics.fn + metrics.tn))
-  else:
-    print(split, "accuracy 0")
+    if metrics.tp + metrics.fp + metrics.fn + metrics.tn != 0:
+      print(split, "accuracy", (metrics.tp + metrics.tn)/(metrics.tp + metrics.fp + metrics.fn + metrics.tn))
+    else:
+      print(split, "accuracy 0")
 
-  if metrics.tp + metrics.fp != 0:
-    print(split, "precision", (metrics.tp)/(metrics.tp + metrics.fp))
-  else:
-    print(split, "precision 0")
+    if metrics.tp + metrics.fp != 0:
+      print(split, "precision", (metrics.tp)/(metrics.tp + metrics.fp))
+    else:
+      print(split, "precision 0")
 
-  cm = confusion_matrix(metrics.y_true, metrics.y_pred)
-  print(cm)
+    cm = confusion_matrix(metrics.y_true, metrics.y_pred)
+    print(cm)
   #title = str(epoch_num) + ' ' + str(threshold) + ' ' + split + ' Confusion Matrix'
   #plt.ylabel('True Label')
   #plt.xlabel('Predicated Label')
@@ -330,24 +333,23 @@ def train(net, criterion, optimizer, epoch):
   print("Training network")
   losses = AverageMeter()
   Config.best_acc = 0
-  outputs1 = []
-  outputs2 = []
-  labels = []
-  
+
+  metrics = []
+  for i in range(1, 13, 2):
+    metrics.append(MetricMeter(i/10))
+
   size_train = len(training_data)
   permutation = torch.randperm(len(training_data))
 
   for b in range(0, size_train, Config.batch_size):
     indices = permutation[b:b + Config.batch_size]
     total_loss = 0
-    if b % 200 == 0:
-      print(b)
     for p in indices:
       protein1, protein2, label = getProteinPair(p, "train")
       output1, output2 = net(protein1, protein2)
-      outputs1.append(output1)
-      outputs2.append(output2)
-      labels.append(label)
+
+      for metric in metrics:
+        metric.update(getPred(output1, output2, metric.threshold), label)
       contrastive_loss = criterion(output1, output2, label)
       total_loss = total_loss + contrastive_loss
       losses.update(contrastive_loss.data[0])
@@ -364,7 +366,7 @@ def train(net, criterion, optimizer, epoch):
     'best_acc': Config.best_acc,
     'optimizer': optimizer.state_dict()})
 
-  return losses, outputs1, outputs2, labels
+  return losses, metrics
 
 
 
@@ -457,28 +459,15 @@ def main():
                    
   for epoch in range(Config.start_epoch, Config.train_epochs):
     print("Epoch", epoch)
-    train_losses, train_outputs1, train_outputs2, train_labels = train(net, criterion, optimizer, epoch)
+    train_losses, train_metrics = train(net, criterion, optimizer, epoch)
     print("train losses", train_losses.avg)
-    for i in range(2, 12, 2):
-      i = i/10
-      print("train threshold", i)
-      train_metrics = findMetrics(train_outputs1, train_outputs2, train_labels, i)
-      print_eval(train_metrics, 'train', epoch, i)
+    print_eval(train_metrics, 'train', epoch)
     train_metrics = []
     if epoch % 3 == 0:
-        val_losses, val_outputs1, val_outputs2, val_labels = eval(net, criterion, optimizer, 'val')
+        val_losses, val_metrics = eval(net, criterion, optimizer, 'val')
         print("val losses", val_losses.avg)
-        for i in range(2, 12, 2):
-          i = i/10
-          print("val threshold", i)
-          val_metrics = findMetrics(val_outputs1, val_outputs2, val_labels, i)
-          print_eval(val_metrics, 'val', epoch, i)  
+        print_eval(val_metrics, 'val', epoch)
         val_metrics = []
-    
-  
-
-
-
 
 
 
