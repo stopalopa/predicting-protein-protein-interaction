@@ -51,18 +51,16 @@ class Config():
   val_size = 0
   test_size = 0
 
-
-
 def letterToIndex(letter):
   return char_to_index[letter]
 
 def letterToTensor(letter):
-  tensor = torch.zeros(1, n_letters)
+  tensor = torch.zeros(1, n_letters).cuda()
   tensor[0][letterToIndex(letter)] = 1
   return tensor
 
 def aminoAcidstoTensor(aminoAcidSeq):
-  tensor = torch.zeros(1, n_letters, len(aminoAcidSeq))  #torch.zeros(len(aminoAcidSeq), 1, n_letters)
+  tensor = torch.zeros(1, n_letters, len(aminoAcidSeq)).cuda()  #torch.zeros(len(aminoAcidSeq), 1, n_letters)
   for idx, letter in enumerate(aminoAcidSeq):
     tensor[0][letterToIndex(letter)][idx] = 1
   return tensor
@@ -98,7 +96,7 @@ def importData():
 
 def save_checkpoint(state):
   print(" ")
-  filename="./"  + Config.checkpoint_dir + "/checkpoint" + "_" + str(state['epoch']) + ".tar"
+  filename="./"  + Config.checkpoint_dir + "/checkpoint" + "_" + ".tar"
   torch.save(state, filename)
 
 
@@ -123,7 +121,7 @@ def getProteinPair(index, data_set):
   protein_1_tensor = protein_1_tensor.unsqueeze(0)  # add a dimension for c_in
   protein_2_tensor = protein_2_tensor.unsqueeze(0)
 
-  label_tensor = Variable(torch.LongTensor([categories.index(int(label))]))
+  label_tensor = Variable(torch.LongTensor([categories.index(int(label))]).cuda())
   return protein_1_tensor, protein_2_tensor, label_tensor
 
 
@@ -138,9 +136,9 @@ class ContrastiveLoss(torch.nn.Module):
 
     def forward(self, output1, output2, label):
         euclidean_distance = F.pairwise_distance(output1, output2)
-        label = label.type(torch.FloatTensor)
-        loss_contrastive = torch.mean((1-label) * torch.pow(euclidean_distance, 2) +
-                                      (label) * torch.pow(torch.clamp(Config.margin - euclidean_distance, min=0.0), 2))
+        label = label.type(torch.FloatTensor).cuda()
+        loss_contrastive = torch.mean((1-label) * torch.pow(euclidean_distance, 2).cuda() +
+                                      (label) * torch.pow(torch.clamp(Config.margin - euclidean_distance, min=0.0), 2)).cuda()
 
         return loss_contrastive
 
@@ -266,6 +264,7 @@ def findMetrics(outputs_1, outputs_2, labels, threshold):
 
       
 def eval(net, criterion, optimizer, split):
+  print("Evaluating split: ", split)
   outputs1 = []
   outputs2 = []
   labels = []
@@ -274,11 +273,12 @@ def eval(net, criterion, optimizer, split):
     data_set = val_data
   elif split == 'test':
     data_set = test_data
+  
   size_split = len(data_set)
 
   net.eval()
   losses = AverageMeter()
- 
+
   for i in range(0, size_split):
     protein1, protein2, label = getProteinPair(i, split)
     output1, output2 = net(protein1, protein2)
@@ -292,28 +292,42 @@ def eval(net, criterion, optimizer, split):
 
 
 def print_eval(metrics, split, epoch_num, threshold):
+  print("true positives", metrics.tp, "false positives", metrics.fp, "true negatives", metrics.tn, "false negatives", metrics.fn)
+
   if metrics.tp + metrics.fn != 0:
     print(split,"sensitivity", (metrics.tp)/(metrics.tp + metrics.fn))
+  else:
+    print(split, "sensitivity 0")
+  
   if metrics.tn + metrics.fp != 0:
     print(split, "specificity", (metrics.tn)/(metrics.tn + metrics.fp))
+  else:
+    print(split, "specificity 0")
+  
   if metrics.tp + metrics.fp + metrics.fn + metrics.tn != 0:
     print(split, "accuracy", (metrics.tp + metrics.tn)/(metrics.tp + metrics.fp + metrics.fn + metrics.tn))
+  else:
+    print(split, "accuracy 0")
+
   if metrics.tp + metrics.fp != 0:
     print(split, "precision", (metrics.tp)/(metrics.tp + metrics.fp))
+  else:
+    print(split, "precision 0")
 
   cm = confusion_matrix(metrics.y_true, metrics.y_pred)
   print(cm)
-  title = str(epoch_num) + ' ' + str(threshold) + ' ' + split + ' Confusion Matrix'
-  plt.ylabel('True Label')
-  plt.xlabel('Predicated Label')
-  plt.matshow(cm)
-  fig_name = str(epoch_num) + "_" + str(threshold) + "_" + split + "_confusion_mat.png"
-  path = Config.checkpoint_dir + "/plots/" + fig_name
-  plt.savefig(path)
-  plt.cla()
-  plt.close()
+  #title = str(epoch_num) + ' ' + str(threshold) + ' ' + split + ' Confusion Matrix'
+  #plt.ylabel('True Label')
+  #plt.xlabel('Predicated Label')
+  #plt.matshow(cm)
+  #fig_name = str(epoch_num) + "_" + str(threshold) + "_" + split + "_confusion_mat.png"
+  #path = Config.checkpoint_dir + "/plots/" + fig_name
+  #plt.savefig(path)
+  #plt.cla()
+  #plt.close()
 
 def train(net, criterion, optimizer, epoch):
+  print("Training network")
   losses = AverageMeter()
   Config.best_acc = 0
   outputs1 = []
@@ -321,13 +335,13 @@ def train(net, criterion, optimizer, epoch):
   labels = []
   
   size_train = len(training_data)
-  size_train = 2
-  if Config.train_size != 0:
-    size_train = Config.train_size
   permutation = torch.randperm(len(training_data))
+
   for b in range(0, size_train, Config.batch_size):
     indices = permutation[b:b + Config.batch_size]
     total_loss = 0
+    if b % 200 == 0:
+      print(b)
     for p in indices:
       protein1, protein2, label = getProteinPair(p, "train")
       output1, output2 = net(protein1, protein2)
@@ -336,18 +350,19 @@ def train(net, criterion, optimizer, epoch):
       labels.append(label)
       contrastive_loss = criterion(output1, output2, label)
       total_loss = total_loss + contrastive_loss
+      losses.update(contrastive_loss.data[0])
     avg_loss = total_loss/Config.batch_size
     avg_loss.backward()
     optimizer.step()
-    optimizer.zero_grad()
-
-    loss_history.append(contrastive_loss.data[0])
-        
-    save_checkpoint({
-      'epoch':epoch+1,
-      'state_dict': net.state_dict(),
-      'best_acc': Config.best_acc,
-      'optimizer': optimizer.state_dict()})
+    optimizer.zero_grad() 
+  loss_history.append(losses.avg)
+  
+  print("Saving checkpoint")  
+  save_checkpoint({
+    'epoch':epoch+1,
+    'state_dict': net.state_dict(),
+    'best_acc': Config.best_acc,
+    'optimizer': optimizer.state_dict()})
 
   return losses, outputs1, outputs2, labels
 
@@ -444,31 +459,29 @@ def main():
     print("Epoch", epoch)
     train_losses, train_outputs1, train_outputs2, train_labels = train(net, criterion, optimizer, epoch)
     print("train losses", train_losses.avg)
-    for i in range(0, 10, 2):
+    for i in range(2, 12, 2):
       i = i/10
       print("train threshold", i)
       train_metrics = findMetrics(train_outputs1, train_outputs2, train_labels, i)
-      #print_eval(train_metrics, 'train', epoch, i)
-    if epoch % 1 == 0:
-        val_losses, val_outputs1, val_outputs2, val_labels  = eval(net, criterion, optimizer, 'val')
+      print_eval(train_metrics, 'train', epoch, i)
+    train_metrics = []
+    if epoch % 3 == 0:
+        val_losses, val_outputs1, val_outputs2, val_labels = eval(net, criterion, optimizer, 'val')
         print("val losses", val_losses.avg)
-        for i in range(0, 10, 1):
+        for i in range(2, 12, 2):
           i = i/10
           print("val threshold", i)
           val_metrics = findMetrics(val_outputs1, val_outputs2, val_labels, i)
           print_eval(val_metrics, 'val', epoch, i)  
+        val_metrics = []
     
   
-  #trn_losses, trn_metrics = eval(net, criterion, optimizer, 'train')
-  #print_eval(trn_losses, trn_metrics, 'train')
- 
- 
-  #val_losses, val_metrics = eval_validate(net, criterion, optimizer, 'val')
-  #print_eval(val_losses, val_metrics, 'val')
 
 
-  #test_losses, test_metrics = eval_test(net, criterion, optimizer, 'test')
-  #print_eval(test_losses, test_metrics, 'test')
+
+
+
+
 
 if __name__ == "__main__":
     main()
